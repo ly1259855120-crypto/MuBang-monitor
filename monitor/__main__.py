@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from dotenv import load_dotenv
 from . import mail
-from .sources import SSE, CNInfo, TZ, title_key
+from .sources import SSE, CNInfo, TZ
 from .store import Store
 
 def raw_body(a, now):
@@ -16,6 +16,12 @@ def raw_body(a, now):
             '本邮件为原始公告提醒，不依赖AI。备用源公告尚需上交所核对。')
 
 def flush(store, sender, now):
+    # User preference: no operational exception/recovery emails, including
+    # legacy queued ones and optional AI error notifications.
+    store.db.execute("""DELETE FROM outbox WHERE sent IS NULL AND
+        (key LIKE 'alert:%' OR key LIKE 'recovery:%' OR key LIKE 'cross:%'
+         OR key LIKE 'ai-failure:%')""")
+    store.db.commit()
     failures = 0
     for key, subject, body in store.pending():
         try:
@@ -42,35 +48,25 @@ def run(store, sources, sender, now=None, force_heartbeat=False):
             results[source.name] = source.fetch('603398', start, now)
             status[source.name] = f'正常，窗口内{len(results[source.name])}条'
         except Exception as exc:
-            status[source.name] = f'异常：{type(exc).__name__}'
+            response = getattr(exc, 'response', None)
+            http_code = getattr(response, 'status_code', None)
+            detail = f' HTTP {http_code}' if http_code is not None else ''
+            status[source.name] = f'异常：{type(exc).__name__}{detail}'
             issues.append(f'{source.name}抓取异常：{type(exc).__name__}。请人工核对公告页并检查接口/网络。')
     status.setdefault('CNINFO', '关闭')
     if 'SSE' in results:
         store.set('last_success', stamp)
         store.count(day, 'success')
     store.set('source_status', status)
-    main_keys = {(title_key(a.title), a.date) for a in results.get('SSE', [])}
     for source_name, announcements in results.items():
         for a in announcements:
-            mismatch = source_name != 'SSE' and (title_key(a.title), a.date) not in main_keys
             nid, fresh = store.remember(a, stamp)
             if fresh:
                 store.enqueue(f'notice:{nid}', f'【*ST沐邦新公告】{a.title}', raw_body(a, stamp))
                 store.db.execute('UPDATE days SET found=found+1 WHERE day=?', (day,))
-            if mismatch:
-                store.enqueue(f'cross:{nid}', '【监控异常】备用源发现公告，主源本轮未确认', raw_body(a, stamp))
             store.db.commit()
-    if issues:
-        # One alert per issue class/day; next day repeats if still unhealthy.
-        import hashlib
-        issue_kind = '|'.join(sorted(k for k, v in status.items() if v.startswith('异常')))
-        if previous and now - datetime.fromisoformat(previous) > timedelta(minutes=30):
-            issue_kind += '|gap'
-        digest = hashlib.sha256(issue_kind.encode()).hexdigest()[:12]
-        store.enqueue(f'alert:{day}:{digest}', '【监控异常】603398 公告监控', '\n'.join(issues) + f'\n检测时间：{stamp}\n源状态：{status}')
-    old_issue = store.get('unhealthy', False)
-    if old_issue and not issues:
-        store.enqueue(f'recovery:{stamp}', '【监控恢复】603398 公告监控', f'检测时间：{stamp}\n源状态：{status}')
+    # Faults remain in state/logs and daily status, never in separate emails.
+    store.set('last_issues', issues)
     store.set('unhealthy', bool(issues))
     # After midnight, send complete statistics for every unsummarized active day.
     # Also send a same-day heartbeat after the configured hour (first run afterwards).
@@ -87,7 +83,9 @@ def run(store, sources, sender, now=None, force_heartbeat=False):
     store.db.commit()
     failures = flush(store, sender, stamp)
     print(f'Checks completed. Sources={status}; mail_failures={failures}')
-    return 1 if failures or issues or any(k.startswith('cross:') for k, _, _ in store.pending()) else 0
+    # Operational warnings stay in logs. Keep the workflow red
+    # for primary-source or delivery failure, not optional-source degradation.
+    return 1 if failures or 'SSE' not in results else 0
 
 def main():
     load_dotenv()
