@@ -1,0 +1,103 @@
+name: Mubang announcement monitor
+on:
+  schedule:
+    - cron: '3-59/10 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: mubang-monitor-state
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Restore durable state branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin monitor-state > /dev/null; then
+            git fetch origin monitor-state
+            git worktree add state FETCH_HEAD
+          else
+            code=$?
+            if [ "$code" -ne 2 ]; then exit "$code"; fi
+            mkdir state
+            git -C state init
+            git -C state switch --orphan monitor-state
+            git -C state remote add origin "$(git remote get-url origin)"
+            # Use checkout's scoped authentication without putting a token in a URL.
+            git config --get-regexp '^http\..*\.extraheader$' | while read -r key value; do
+              git -C state config "$key" "$value"
+            done
+          fi
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check announcements and deliver queued mail
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          SMTP_SECURITY: ${{ vars.SMTP_SECURITY || 'ssl' }}
+          ENABLE_BACKUP: ${{ vars.ENABLE_BACKUP || 'true' }}
+          HEARTBEAT_HOUR: ${{ vars.HEARTBEAT_HOUR || '23' }}
+          CNINFO_ORG_ID: ${{ vars.CNINFO_ORG_ID }}
+        run: |
+          if [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
+            python -m monitor --heartbeat
+          else
+            python -m monitor
+          fi
+      - name: Persist state even when monitoring or SMTP fails
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f state/monitor.sqlite3 ]; then exit 0; fi
+          git -C state config user.name 'github-actions[bot]'
+          git -C state config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C state add monitor.sqlite3
+          if ! git -C state diff --cached --quiet; then
+            git -C state commit -m 'Persist monitor state'
+            git -C state push origin HEAD:monitor-state
+          fi
+      - name: Optional AI (raw notification state already saved)
+        if: success() && vars.ENABLE_AI == 'true'
+        timeout-minutes: 4
+        env:
+          ENABLE_AI: 'true'
+          AI_ENDPOINT: ${{ vars.AI_ENDPOINT }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          SMTP_SECURITY: ${{ vars.SMTP_SECURITY || 'ssl' }}
+        run: |
+          pip install -r requirements-ai.txt
+          python -m monitor.ai
+      - name: Persist optional AI state
+        if: always() && vars.ENABLE_AI == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f state/monitor.sqlite3 ]; then exit 0; fi
+          git -C state add monitor.sqlite3
+          if ! git -C state diff --cached --quiet; then
+            git -C state commit -m 'Persist optional AI state'
+            git -C state push origin HEAD:monitor-state
+          fi
